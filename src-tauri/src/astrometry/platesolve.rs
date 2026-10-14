@@ -64,44 +64,89 @@ pub fn solved(
     solution: AstrometricSolution,
     sources: &[SourceMeasurement],
 ) -> PlateSolveResult {
-    let quality = evaluate_astrometric_quality(
+    let mut quality = evaluate_astrometric_quality(
         &solution.matches,
         sources,
         solution.wcs.image_width,
         solution.wcs.image_height,
     );
+    quality.plate_model_requested = solution.plate_model_requested.as_str().to_string();
+    quality.plate_model_applied = solution.plate_model_applied.as_str().to_string();
+    quality.sip_order = solution.sip_order;
+    quality.sip_escalation_attempted = solution.sip_escalation_attempted;
+    quality.sip_escalation_succeeded = solution.sip_escalation_succeeded;
+    quality.sip_fit_converged = solution.sip_fit_converged;
+    quality.plate_model_downgraded = solution.plate_model_downgraded;
+    quality.plate_model_downgrade_reason = solution.plate_model_downgrade_reason.clone();
+    if let Some(reason) = &solution.sip_rejection_reason {
+        quality.status = ReductionStatus::Rejected;
+        quality.reasons.push(reason.clone());
+    }
+
     let accepted = quality.status == ReductionStatus::Accepted;
+    let sip_label = solution.sip_order.map(|order| match order {
+        2 => "二阶",
+        3 => "三阶",
+        _ => "SIP",
+    });
+    let downgrade_note = solution
+        .plate_model_downgrade_reason
+        .as_deref()
+        .map(|reason| format!("；板模型已降级：{reason}"))
+        .unwrap_or_default();
+    let rejection_reason = solution.sip_rejection_reason.clone();
+    let failure_code = (!accepted).then(|| {
+        match rejection_reason.as_deref() {
+            Some("implausible_distortion") => "implausible_distortion",
+            Some("sip_fit_not_converged") => "sip_fit_not_converged",
+            Some("distortion_suspected") => "distortion_suspected",
+            _ if quality.distortion_suspected => "distortion_suspected",
+            _ => "quality_gate",
+        }
+        .to_string()
+    });
     let message = match quality.status {
-        ReductionStatus::Accepted => format!(
-            "归算通过：匹配 {} 颗参考星，RMS {:.3} arcsec，P95 {:.3} arcsec。",
-            solution.matches.len(),
-            quality.residual_rms_arcsec,
-            quality.residual_p95_arcsec
-        ),
+        ReductionStatus::Accepted => match sip_label {
+            Some(label) => format!(
+                "归算通过（{label} SIP 畸变校正）：匹配 {} 颗参考星，RMS {:.3} arcsec，P95 {:.3} arcsec。{downgrade_note}",
+                solution.matches.len(),
+                quality.residual_rms_arcsec,
+                quality.residual_p95_arcsec
+            ),
+            None => format!(
+                "归算通过：匹配 {} 颗参考星，RMS {:.3} arcsec，P95 {:.3} arcsec。{downgrade_note}",
+                solution.matches.len(),
+                quality.residual_rms_arcsec,
+                quality.residual_p95_arcsec
+            ),
+        },
         ReductionStatus::ReviewRequired => format!(
-            "归算需要复核：匹配 {} 颗参考星，RMS {:.3} arcsec；{}",
+            "归算需要复核：匹配 {} 颗参考星，RMS {:.3} arcsec；{}{downgrade_note}",
             solution.matches.len(),
             quality.residual_rms_arcsec,
             quality.reasons.join("；")
         ),
-        ReductionStatus::Rejected => format!("归算被拒绝：{}", quality.reasons.join("；")),
+        ReductionStatus::Rejected => match rejection_reason.as_deref() {
+            Some("implausible_distortion") => {
+                format!("归算被拒绝：拟合出的畸变模型不物理（角点偏移过大或径向修正非单调）{downgrade_note}")
+            }
+            Some("sip_fit_not_converged") => {
+                format!("归算被拒绝：SIP 畸变拟合未收敛，未采用不确定的畸变模型{downgrade_note}")
+            }
+            _ => format!("归算被拒绝：{}{downgrade_note}", quality.reasons.join("；")),
+        },
     };
+    let num_matched = solution.matches.len() as u32;
+    let residual_rms = Some(solution.rms_arcsec);
     PlateSolveResult {
         run_id: None,
         success: accepted,
         status: quality.status,
-        failure_code: (!accepted).then(|| {
-            if quality.distortion_suspected {
-                "distortion_suspected"
-            } else {
-                "quality_gate"
-            }
-            .into()
-        }),
+        failure_code,
         wcs: Some(solution.wcs),
-        num_matched: solution.matches.len() as u32,
+        num_matched,
         num_catalog,
-        residual_rms: Some(solution.rms_arcsec),
+        residual_rms,
         backend: Some(
             "extended Delaunay / hinted pair voting + iterative robust TAN/CD".to_string(),
         ),
@@ -128,5 +173,96 @@ impl PlateSolveResult {
             quality.status = ReductionStatus::Accepted;
         }
         self.message = format!("人工复核通过：{}", self.message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::astrometry::matcher::PlateModel;
+
+    #[test]
+    fn sip_rejection_cannot_be_accepted_or_manually_confirmed() {
+        let sources: Vec<_> = (0..16)
+            .map(|index| SourceMeasurement {
+                x: 80.0 + (index % 4) as f64 * 250.0,
+                y: 80.0 + (index / 4) as f64 * 250.0,
+                peak: 100.0,
+                flux: 1_000.0,
+                fwhm: 3.0,
+                ellipticity: 0.1,
+                npix: 20,
+                flags: 0,
+                saturated: false,
+                snr: Some(30.0),
+                x_error_px: Some(0.05),
+                y_error_px: Some(0.05),
+                centroid_refined: true,
+            })
+            .collect();
+        for count in [8, 16] {
+            let matches: Vec<_> = (0..count)
+                .map(|index| AstrometricMatch {
+                    image_source_index: index,
+                    catalog_source_index: index,
+                    residual_arcsec: 0.12,
+                    residual_x_arcsec: 0.08,
+                    residual_y_arcsec: 0.09,
+                    weight: 1.0,
+                    used: true,
+                    rejection_reason: None,
+                })
+                .collect();
+            let ordinary = evaluate_astrometric_quality(&matches, &sources, 1_000, 1_000);
+            assert_eq!(
+                ordinary.status,
+                if count == 8 {
+                    ReductionStatus::ReviewRequired
+                } else {
+                    ReductionStatus::Accepted
+                }
+            );
+            for reason in [
+                "sip_fit_not_converged",
+                "implausible_distortion",
+                "distortion_suspected",
+            ] {
+                let solution = AstrometricSolution {
+                    wcs: Wcs {
+                        crpix1: 500.0,
+                        crpix2: 500.0,
+                        crval1: 180.0,
+                        crval2: 30.0,
+                        cd1_1: -1.0 / 3_600.0,
+                        cd1_2: 0.0,
+                        cd2_1: 0.0,
+                        cd2_2: 1.0 / 3_600.0,
+                        image_width: 1_000,
+                        image_height: 1_000,
+                        sip: None,
+                    },
+                    matches: matches.clone(),
+                    rms_arcsec: 0.12,
+                    plate_model_requested: PlateModel::Cubic,
+                    plate_model_applied: PlateModel::Linear,
+                    sip_order: None,
+                    sip_escalation_attempted: true,
+                    sip_escalation_succeeded: false,
+                    sip_fit_converged: Some(reason != "sip_fit_not_converged"),
+                    plate_model_downgraded: false,
+                    plate_model_downgrade_reason: None,
+                    sip_rejection_reason: Some(reason.into()),
+                };
+                let mut result = solved(16, solution, &sources);
+                result.confirm_review();
+                assert!(!result.success);
+                assert!(!result.manual_review_confirmed);
+                assert_eq!(result.status, ReductionStatus::Rejected);
+                assert_eq!(result.failure_code.as_deref(), Some(reason));
+                let quality = result.quality.unwrap();
+                assert_eq!(quality.status, ReductionStatus::Rejected);
+                assert!(quality.reasons.iter().any(|item| item == reason));
+            }
+        }
     }
 }
