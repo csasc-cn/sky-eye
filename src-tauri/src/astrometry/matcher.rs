@@ -1395,13 +1395,16 @@ fn escalate_plate_model(
     let scale = f64::from(width.max(height)) * 0.5;
     let requested = config.plate_model.order();
 
-    let supported = highest_supported_order(matches.len(), requested);
-    let downgrade_reason = if supported < requested {
+    let training_count = matches.len()
+        - radial_stratified_holdout(image, matches, crpix, config.sip_holdout_fraction).len();
+    let supported = highest_supported_order(training_count, requested);
+    let mut downgrade_reason = if supported < requested {
         Some(format!(
-            "{} 阶板模型需要至少 {} 颗已验证参考星，当前 {} 颗",
+            "{} 阶板模型需要至少 {} 颗训练参考星，当前 {} 颗已验证参考星中留出后剩余 {} 颗",
             config.plate_model.as_str(),
             sip_minimum_matches(requested),
-            matches.len()
+            matches.len(),
+            training_count
         ))
     } else {
         None
@@ -1422,16 +1425,33 @@ fn escalate_plate_model(
     let mut seed_crpix = crpix;
     let mut seed_cd = matrix;
 
-    for order in 2..=supported {
-        if current_matches.len() < sip_minimum_matches(order) {
-            return Ok(PlateModelOutcome::LinearWithDowngrade {
-                reason: format!(
-                    "{} 阶板模型需要至少 {} 颗已验证参考星，当前 {} 颗",
-                    order,
-                    sip_minimum_matches(order),
-                    current_matches.len()
-                ),
-            });
+    // Re-association at lower orders can recover enough references to support
+    // a higher order, so do not freeze the ceiling at the linear seed's count.
+    for order in 2..=requested {
+        let training_count = current_matches.len()
+            - radial_stratified_holdout(
+                image,
+                &current_matches,
+                crpix,
+                config.sip_holdout_fraction,
+            )
+            .len();
+        if training_count < sip_minimum_matches(order) {
+            downgrade_reason = Some(format!(
+                "{} 阶板模型需要至少 {} 颗训练参考星，当前 {} 颗已验证参考星中留出后剩余 {} 颗",
+                order,
+                sip_minimum_matches(order),
+                current_matches.len(),
+                training_count
+            ));
+            // A lower order was already attempted but did not resolve the
+            // distortion. Lack of support for the next order cannot erase that
+            // failure or make the linear fallback manually acceptable.
+            break;
+        }
+
+        if highest_supported_order(training_count, requested) == requested {
+            downgrade_reason = None;
         }
 
         // Refit CD and the tangent-plane offset together, re-anchoring CRPIX on
@@ -2595,6 +2615,102 @@ mod tests {
             .as_deref()
             .expect("downgrade must be reported");
         assert!(reason.contains("cubic"), "reason: {reason}");
+    }
+
+    #[test]
+    fn failed_quadratic_escalation_stays_rejected_when_cubic_is_unsupported() {
+        let field = spread_field(60, Some(quadratic_sip(512.0, 1.0)));
+        let mut config = distorted_config(PlateModel::Cubic);
+        // Require an exact zero validation residual so the quadratic fit cannot
+        // pass, even though it converges and re-associates the references.
+        config.sip_holdout_improvement_fraction = 1.0;
+        let solution = solve_flagged(&field, config);
+        assert!(solution.sip_escalation_attempted);
+        assert!(!solution.sip_escalation_succeeded);
+        assert_eq!(solution.sip_fit_converged, Some(true));
+        assert_eq!(
+            solution.sip_rejection_reason.as_deref(),
+            Some("distortion_suspected")
+        );
+        assert!(solution.plate_model_downgraded);
+        let reason = solution.plate_model_downgrade_reason.as_deref().unwrap();
+        assert!(reason.contains("3 阶"), "reason: {reason}");
+        let mut result = crate::astrometry::platesolve::solved(
+            field.catalog.len() as u32,
+            solution,
+            &field.image,
+        );
+        result.confirm_review();
+        assert!(!result.success);
+        assert!(!result.manual_review_confirmed);
+        assert_eq!(
+            result.status,
+            crate::astrometry::quality::ReductionStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn supported_sip_order_accounts_for_the_actual_holdout_split() {
+        for (count, expected_training, expected_order) in
+            [(36, 27, 1), (50, 35, 1), (60, 40, 2), (90, 65, 3)]
+        {
+            let image: Vec<_> = (0..count)
+                .map(|index| Point {
+                    original_index: index,
+                    x: index as f64,
+                    y: 0.0,
+                    sigma_native: 0.1,
+                })
+                .collect();
+            let matches: Vec<_> = (0..count)
+                .map(|index| AstrometricMatch {
+                    image_source_index: index,
+                    catalog_source_index: index,
+                    residual_arcsec: 0.0,
+                    residual_x_arcsec: 0.0,
+                    residual_y_arcsec: 0.0,
+                    weight: 1.0,
+                    used: true,
+                    rejection_reason: None,
+                })
+                .collect();
+            let config = distorted_config(PlateModel::Cubic);
+            let training = count
+                - radial_stratified_holdout(
+                    &image,
+                    &matches,
+                    Vector2::zeros(),
+                    config.sip_holdout_fraction,
+                )
+                .len();
+            assert_eq!(training, expected_training);
+            assert_eq!(highest_supported_order(training, 3), expected_order);
+            if expected_order == 1 {
+                let outcome = escalate_plate_model(
+                    &image,
+                    &[],
+                    Affine {
+                        x_x: 1.0,
+                        x_y: 0.0,
+                        x_0: 0.0,
+                        y_x: 0.0,
+                        y_y: 1.0,
+                        y_0: 0.0,
+                    },
+                    &matches,
+                    &config,
+                    180.0,
+                    30.0,
+                    1024,
+                    1024,
+                )
+                .unwrap();
+                let PlateModelOutcome::LinearWithDowngrade { reason } = outcome else {
+                    panic!("insufficient training references must downgrade before fitting");
+                };
+                assert!(reason.contains(&format!("剩余 {training} 颗")));
+            }
+        }
     }
 
     #[test]
