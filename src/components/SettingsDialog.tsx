@@ -1015,9 +1015,11 @@ export function SettingsDialog({
                         }
                       />
                     </Field>
-                    <Field label="WCS 模型" hint={reservedReductionHint}>
+                    <Field
+                      label="WCS 模型"
+                      hint="请求的最高阶数；仅在残差趋势与验证通过时启用 SIP 畸变修正。"
+                    >
                       <Select
-                        disabled
                         value={draft.reduction.plate_model}
                         onChange={(e) =>
                           setDraft({
