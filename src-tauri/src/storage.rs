@@ -666,10 +666,6 @@ mod tests {
         // knobs, so silently ignoring one would mislead operators.
         const PENDING_WIRING: &[(&str, &str)] = &[
             (
-                "plate_model",
-                "reserved for the unlanded SIP plate-model work; the solver always fits a 6-parameter affine today",
-            ),
-            (
                 "astrometry_catalog",
                 "single-valued (Gaia3); only Gaia DR3 is implemented",
             ),
